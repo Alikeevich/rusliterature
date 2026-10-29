@@ -12,13 +12,16 @@ import { buildSystemPrompt, cleanChunk } from "@/lib/prompt";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"];
+const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-2.5-flash"];
 const MAX_HISTORY = 20;
-// Vercel обрывает функцию через maxDuration, поэтому держим запас.
-const FIRST_CHUNK_TIMEOUT_MS = 15_000;
-const WAIT_BUDGET_MS = 42_000;
-const TOTAL_BUDGET_MS = 56_000;
 const MAX_MESSAGE_LENGTH = 1000;
+
+// Vercel обрывает функцию через maxDuration, поэтому держим запас.
+// Если модель молчит HEDGE_MS, параллельно запускаем следующую и берём ту, что ответит первой.
+const HEDGE_MS = 8_000;
+const FIRST_CHUNK_TIMEOUT_MS = 30_000;
+const WAIT_BUDGET_MS = 40_000;
+const TOTAL_BUDGET_MS = 57_000;
 
 type Content = { role: "user" | "model"; parts: { text: string }[] };
 
@@ -31,7 +34,7 @@ function sanitizeMessages(raw: unknown): Content[] | null {
     )
     .slice(-MAX_HISTORY)
     .map((m) => ({ role: m.role, parts: [{ text: m.text.trim().slice(0, MAX_MESSAGE_LENGTH) }] }));
-  // API требует, чтобы диалог начинался с реплики пользователя.
+  // API требует, чтобы диалог начинался с реплики пользователя (приветствие героя есть в системном промпте).
   while (messages.length && messages[0].role !== "user") messages.shift();
   if (!messages.length || messages[messages.length - 1].role !== "user") return null;
   return messages;
@@ -41,33 +44,33 @@ function error(message: string, status: number) {
   return Response.json({ error: message }, { status });
 }
 
-// Если модель недоступна для ключа (Google иногда закрывает старые модели),
-// пробуем следующую из списка.
 function modelsToTry() {
   const list = [process.env.GEMINI_MODEL, ...FALLBACK_MODELS].filter((m): m is string => !!m?.trim());
   return [...new Set(list.map((m) => m.trim()))];
 }
 
 function requestBody(model: string, systemPrompt: string, contents: Content[]) {
+  const isGemini3 = model.startsWith("gemini-3");
   return JSON.stringify({
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents,
     generationConfig: {
-      temperature: 0.8,
-      maxOutputTokens: 2048,
-      // Модели 3.x по умолчанию долго «думают»; для живого чата хватает low.
-      ...(model.startsWith("gemini-3") ? { thinkingConfig: { thinkingLevel: "low" } } : {}),
+      maxOutputTokens: 8192,
+      // Для моделей 3.x Google советует не трогать temperature; «думать» долго в живом чате не нужно.
+      ...(isGemini3 ? { thinkingConfig: { thinkingLevel: "low" } } : { temperature: 0.9 }),
     },
+    // Программа по литературе полна войны, смерти и жестокости, поэтому блокируем только явно опасное.
     safetySettings: [
-      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_LOW_AND_ABOVE" },
-      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_ONLY_HIGH" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_ONLY_HIGH" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_ONLY_HIGH" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
     ],
   });
 }
 
 type ApiError = { status: number; message: string; reason: string };
+type Failure = ApiError | "timeout" | "network";
 
 function readApiError(status: number, data: unknown): ApiError {
   const e = (data as { error?: { message?: string; status?: string; details?: { reason?: string }[] } })?.error;
@@ -80,6 +83,11 @@ function readApiError(status: number, data: unknown): ApiError {
 
 function isModelUnavailable(e: ApiError) {
   return e.status === 404 || (e.status === 400 && /model|not (found|supported)|thinking/i.test(e.message));
+}
+
+// Ошибка, при которой нет смысла пробовать другие модели (ключ, доступ, регион).
+function isFatal(f: Failure): f is ApiError {
+  return typeof f !== "string" && !isModelUnavailable(f) && f.status !== 429 && f.status < 500;
 }
 
 // Понятное объяснение ошибки для учителя.
@@ -96,11 +104,12 @@ function explain(e: ApiError) {
   return error("Собеседник сейчас не может ответить. Попробуйте чуть позже.", 502);
 }
 
-type Events = AsyncGenerator<GeminiEvent, void, unknown>;
 type GeminiEvent = {
-  candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[];
+  candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] }; finishReason?: string }[];
+  promptFeedback?: { blockReason?: string };
   error?: unknown;
 };
+type Events = AsyncGenerator<GeminiEvent, void, unknown>;
 
 // Разбор потока Server-Sent Events от Gemini.
 async function* sseEvents(body: ReadableStream<Uint8Array>): Events {
@@ -136,70 +145,141 @@ function eventText(event: GeminiEvent) {
     .join("");
 }
 
-type Attempt =
-  | { ok: true; first: string; events: Events; abort: AbortController }
-  | { ok: false; error: ApiError | "timeout" | "network" };
+function stopReason(event: GeminiEvent) {
+  return event.promptFeedback?.blockReason || event.candidates?.[0]?.finishReason;
+}
 
-// Один запрос к модели: ждём первый кусочек текста не дольше timeoutMs.
-async function attempt(model: string, apiKey: string, body: string, timeoutMs: number): Promise<Attempt> {
-  const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), timeoutMs);
+type Started = { model: string; first: string; firstStop?: string; events: Events; abort: AbortController };
+
+// Один запрос к модели: ждём первый кусочек текста. Отменяется через abort.
+async function attempt(model: string, apiKey: string, body: string, abort: AbortController): Promise<Started> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+  let response: Response;
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-    const response = await fetch(url, {
+    response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
       body,
       signal: abort.signal,
     });
+  } catch (err) {
+    if (abort.signal.aborted) throw "timeout";
+    console.error("Model request failed", model, err);
+    throw "network";
+  }
 
-    if (!response.ok || !response.body) {
-      const data = await response.json().catch(() => null);
-      console.error("Model API error", model, response.status, JSON.stringify(data));
-      return { ok: false, error: readApiError(response.status, data) };
-    }
+  if (!response.ok || !response.body) {
+    const data = await response.json().catch(() => null);
+    console.error("Model API error", model, response.status, JSON.stringify(data));
+    throw readApiError(response.status, data);
+  }
 
-    const events = sseEvents(response.body);
+  const events = sseEvents(response.body);
+  try {
     while (true) {
       const next = await events.next();
-      if (next.done) return { ok: true, first: "", events, abort };
+      if (next.done) return { model, first: "", events, abort };
       if (next.value.error) {
         console.error("Model stream error", model, JSON.stringify(next.value.error));
-        return { ok: false, error: "network" };
+        throw "network";
       }
       const text = eventText(next.value);
-      if (text) return { ok: true, first: text, events, abort };
+      const stop = stopReason(next.value);
+      if (text || (stop && stop !== "STOP")) return { model, first: text, firstStop: stop, events, abort };
     }
   } catch (err) {
-    const timedOut = abort.signal.aborted;
-    console.error(timedOut ? "Model timeout" : "Model request failed", model, timedOut ? `${timeoutMs}ms` : err);
-    return { ok: false, error: timedOut ? "timeout" : "network" };
-  } finally {
-    clearTimeout(timer);
+    if (typeof err === "string") throw err;
+    throw abort.signal.aborted ? "timeout" : "network";
   }
 }
 
-function streamReply(first: string, events: Events, abort: AbortController, deadline: number) {
+// Запускаем модели по очереди с подстраховкой: если текущая молчит HEDGE_MS,
+// стартует следующая, но и первая продолжает работать. Побеждает первая ответившая.
+function race(models: string[], apiKey: string, makeBody: (model: string) => string, deadline: number) {
+  return new Promise<Started | Failure>((resolve) => {
+    const running = new Map<string, AbortController>();
+    let index = 0;
+    let finished = false;
+    let lastFailure: Failure = "timeout";
+    let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (result: Started | Failure) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(hedgeTimer);
+      const winner = typeof result === "object" && "events" in result ? result.model : null;
+      for (const [model, abort] of running) if (model !== winner) abort.abort();
+      resolve(result);
+    };
+
+    const startNext = () => {
+      clearTimeout(hedgeTimer);
+      if (finished) return;
+      const left = deadline - Date.now();
+      if (index >= models.length || left < 3000) {
+        if (!running.size) finish(lastFailure);
+        return;
+      }
+
+      const model = models[index++];
+      const abort = new AbortController();
+      running.set(model, abort);
+      const timeout = setTimeout(() => abort.abort(), Math.min(FIRST_CHUNK_TIMEOUT_MS, left));
+      const startedAt = Date.now();
+
+      attempt(model, apiKey, makeBody(model), abort)
+        .then((started) => {
+          console.log("Model answered", model, `${Date.now() - startedAt}ms`);
+          finish(started);
+        })
+        .catch((failure: Failure) => {
+          if (finished) return; // отменили, потому что другая модель ответила раньше
+          if (failure === "timeout") console.error("Model timeout", model, `${Date.now() - startedAt}ms`);
+          running.delete(model);
+          lastFailure = failure;
+          if (isFatal(failure)) finish(failure);
+          else startNext();
+        })
+        .finally(() => clearTimeout(timeout));
+
+      hedgeTimer = setTimeout(startNext, HEDGE_MS);
+    };
+
+    startNext();
+  });
+}
+
+const SAFE_ENDING = " ...Прости, дальше мне тяжело об этом говорить. Спроси меня о другом.";
+
+function streamReply({ model, first, firstStop, events, abort }: Started, deadline: number) {
   const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const kill = setTimeout(() => abort.abort(), Math.max(1000, deadline - Date.now()));
-      controller.enqueue(
-        encoder.encode(
-          first ? cleanChunk(first) : "Хм... Об этом мне трудно говорить. Спроси меня лучше о чём-нибудь другом из книги."
-        )
-      );
+      let sent = first.length > 0;
+      let stop = firstStop;
+      if (sent) controller.enqueue(encoder.encode(cleanChunk(first)));
       try {
-        while (true) {
+        while (!stop || stop === "STOP") {
           const next = await events.next();
           if (next.done) break;
           const text = eventText(next.value);
-          if (text) controller.enqueue(encoder.encode(cleanChunk(text)));
+          stop = stopReason(next.value) || stop;
+          if (text) {
+            controller.enqueue(encoder.encode(cleanChunk(text)));
+            sent = true;
+          }
         }
       } catch {
-        /* оборвалось по времени: отдаём то, что успели */
+        stop = stop || "ABORTED";
       } finally {
         clearTimeout(kill);
+        if (stop && stop !== "STOP") {
+          console.error("Model stopped early", model, stop);
+          controller.enqueue(encoder.encode(sent ? SAFE_ENDING : SAFE_ENDING.slice(4)));
+        } else if (!sent) {
+          controller.enqueue(encoder.encode("Хм... Об этом мне трудно говорить. Спроси меня лучше о чём-нибудь другом из книги."));
+        }
         controller.close();
       }
     },
@@ -222,31 +302,24 @@ export async function POST(req: Request) {
   if (!contents) return error("Пустое сообщение", 400);
 
   const systemPrompt = buildSystemPrompt(character);
-  let lastError: ApiError | "timeout" | "network" | null = null;
+  const result = await race(
+    modelsToTry(),
+    apiKey,
+    (model) => requestBody(model, systemPrompt, contents),
+    startedAt + WAIT_BUDGET_MS
+  );
 
-  for (const model of modelsToTry()) {
-    const left = startedAt + WAIT_BUDGET_MS - Date.now();
-    if (left < 4000) break;
-
-    const result = await attempt(model, apiKey, requestBody(model, systemPrompt, contents), Math.min(FIRST_CHUNK_TIMEOUT_MS, left));
-    if (result.ok) {
-      console.log("Model answered", model, `${Date.now() - startedAt}ms`);
-      return new Response(streamReply(result.first, result.events, result.abort, startedAt + TOTAL_BUDGET_MS), {
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-          "Cache-Control": "no-cache, no-transform",
-          "X-Accel-Buffering": "no",
-        },
-      });
-    }
-
-    lastError = result.error;
-    if (lastError === "timeout" || lastError === "network" || isModelUnavailable(lastError)) continue;
-    return explain(lastError);
+  if (typeof result === "object" && "events" in result) {
+    return new Response(streamReply(result, startedAt + TOTAL_BUDGET_MS), {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+      },
+    });
   }
 
-  if (lastError === "timeout" || lastError === null)
-    return error("Герой слишком долго думает. Попробуйте спросить ещё раз через минуту.", 504);
-  if (lastError === "network") return error("Нет связи с сервером модели. Попробуйте снова.", 502);
-  return explain(lastError);
+  if (result === "timeout") return error("Герой слишком долго думает. Попробуйте спросить ещё раз через минуту.", 504);
+  if (result === "network") return error("Нет связи с сервером модели. Попробуйте снова.", 502);
+  return explain(result);
 }
