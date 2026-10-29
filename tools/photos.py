@@ -59,8 +59,19 @@ def crop_box(img_w, img_h, ratio, face, face_share, face_y):
     return x, y, w, h
 
 
+def trim_bars(img, threshold=18):
+    """Срезает однотонные чёрные полосы по краям (кадры из фильмов)."""
+    gray = np.array(img.convert("L"), dtype=np.int16)
+    cols = np.where(gray.mean(axis=0) > threshold)[0]
+    rows = np.where(gray.mean(axis=1) > threshold)[0]
+    if not len(cols) or not len(rows):
+        return img
+    box = (cols[0], rows[0], cols[-1] + 1, rows[-1] + 1)
+    return img.crop(box) if box != (0, 0, img.width, img.height) else img
+
+
 def process(path):
-    img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    img = trim_bars(ImageOps.exif_transpose(Image.open(path)).convert("RGB"))
     face = find_face(img)
     person = path.stem.lower()
     OUT.mkdir(parents=True, exist_ok=True)
