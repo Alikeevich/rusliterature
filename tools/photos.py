@@ -1,9 +1,9 @@
 """Обрезает фотографии героев и авторов под сайт.
 
 Исходники кладутся в photos/<person>.<jpg|png|webp>, где person - значение
-поля person из data/characters.js (или из AUTHOR_PERSON).
+поля person из lib/characters.ts.
 Скрипт находит лицо, делает портрет 4:5 для карточки и квадрат для аватарки,
-сохраняет их в img/people/ и обновляет data/photos.js.
+сохраняет их в public/img/people/ и обновляет lib/photos.ts.
 
 Запуск: python3 tools/photos.py   (нужны pillow и opencv-python-headless)
 """
@@ -18,11 +18,11 @@ from PIL import Image, ImageOps
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "photos"
-OUT = ROOT / "img" / "people"
+OUT = ROOT / "public" / "img" / "people"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif"}
 
-CARD_SIZE = (600, 750)
-SQUARE_SIZE = 320
+CARD_SIZE = (960, 1200)
+SQUARE_SIZE = 400
 
 
 def find_face(img):
@@ -77,7 +77,9 @@ def process(path):
     OUT.mkdir(parents=True, exist_ok=True)
 
     x, y, w, h = crop_box(img.width, img.height, CARD_SIZE[0] / CARD_SIZE[1], face, 0.30, 0.36)
-    card = img.crop((round(x), round(y), round(x + w), round(y + h))).resize(CARD_SIZE, Image.LANCZOS)
+    card = img.crop((round(x), round(y), round(x + w), round(y + h)))
+    # Маленькие исходники не растягиваем сильнее, чем есть.
+    card = card.resize(CARD_SIZE if card.width >= CARD_SIZE[0] else (round(card.width), round(card.width * 1.25)), Image.LANCZOS)
     card.save(OUT / f"{person}.webp", "WEBP", quality=82, method=6)
 
     x, y, w, h = crop_box(img.width, img.height, 1.0, face, 0.48, 0.45)
@@ -94,9 +96,9 @@ def main():
         process(path)
 
     people = sorted(p.stem for p in OUT.glob("*.webp") if not p.stem.endswith("-sq")) if OUT.exists() else []
-    (ROOT / "data" / "photos.js").write_text(
-        "// Список фотографий, которые есть в img/people. Обновляется скриптом tools/photos.py.\n"
-        f"export const PHOTOS = {json.dumps(people, ensure_ascii=False)};\n",
+    (ROOT / "lib" / "photos.ts").write_text(
+        "// Список фотографий, которые есть в public/img/people. Обновляется скриптом tools/photos.py.\n"
+        f"export const PHOTOS: string[] = {json.dumps(people, ensure_ascii=False)};\n",
         encoding="utf-8",
     )
     print(f"Готово: {len(files)} обработано, всего фото на сайте: {len(people)}")

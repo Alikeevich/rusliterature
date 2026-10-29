@@ -1,13 +1,29 @@
 {
   "name": "adal-azamat-literature",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Стена персонажей: чат с героями произведений по русской литературе (6–9 классы) на тему «Адал азамат»",
-  "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "description": "Стена героев книг по русской литературе (6-9 классы) с чатом, тема «Адал азамат»",
   "scripts": {
-    "dev": "vercel dev"
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.64.0",
+    "motion": "^14.8.0",
+    "next": "^15.5.28",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "postcss": "^8.5.32",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3"
   }
 }

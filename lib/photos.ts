@@ -1,0 +1,2 @@
+// Список фотографий, которые есть в public/img/people. Обновляется скриптом tools/photos.py.
+export const PHOTOS: string[] = ["abai", "abai_young", "abulkhair", "akbara", "avalbek", "avdiy", "baluan_sholak", "boston", "er_tostik", "gamzatov", "gundarev", "kabanbaev", "kairbekov", "kasym", "kaysenov", "kuliev", "kunanbay", "makataev", "momyshuly", "musatov", "musrepov", "myrzaliev", "ongarsynova", "panfilov", "seifullin", "shakhanov", "suleimenov", "tukay", "vasiliev", "zhansugurov"];
