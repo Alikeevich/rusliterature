@@ -1,43 +1,48 @@
-import { GRADES, CHARACTERS, getCharacter } from "/data/characters.js";
+import { GRADES, CHARACTERS, AUTHOR_PERSON, getCharacter } from "/data/characters.js";
+import { PHOTOS } from "/data/photos.js";
 
-const tabsEl = document.getElementById("tabs");
-const wallEl = document.getElementById("wall");
+const $ = (id) => document.getElementById(id);
 
-const chatEl = document.getElementById("chat");
-const backdropEl = document.getElementById("chatBackdrop");
-const chatAvatar = document.getElementById("chatAvatar");
-const chatName = document.getElementById("chatName");
-const chatWork = document.getElementById("chatWork");
-const chatLog = document.getElementById("chatLog");
-const chatSuggestions = document.getElementById("chatSuggestions");
-const chatForm = document.getElementById("chatForm");
-const chatInput = document.getElementById("chatInput");
-const chatSend = document.getElementById("chatSend");
-const chatClose = document.getElementById("chatClose");
-const chatClear = document.getElementById("chatClear");
+const tabsEl = $("tabs");
+const wallEl = $("wall");
+
+const chatEl = $("chat");
+const chatAvatar = $("chatAvatar");
+const chatName = $("chatName");
+const chatWork = $("chatWork");
+const chatPortrait = $("chatPortrait");
+const chatIntroName = $("chatIntroName");
+const chatIntroWork = $("chatIntroWork");
+const chatScroll = $("chatScroll");
+const chatLog = $("chatLog");
+const chatSuggestions = $("chatSuggestions");
+const chatForm = $("chatForm");
+const chatInput = $("chatInput");
+const chatSend = $("chatSend");
+
+const photoSet = new Set(PHOTOS);
 
 let currentGrade = GRADES[0].id;
-let current = null; // текущий персонаж
-let history = []; // [{ role: "user" | "model", text }]
+let current = null; // открытый персонаж
+let messages = []; // [{ role: "user" | "model", text }]
 let busy = false;
 let lastFocus = null;
 
-// ───────── Хранилище (история чатов у каждого ученика в браузере) ─────────
+// ───────── История чатов (в браузере ученика) ─────────
 const storage = {
   load(id) {
     try {
-      const raw = localStorage.getItem(`chat:${id}`);
-      const parsed = raw ? JSON.parse(raw) : null;
+      const parsed = JSON.parse(localStorage.getItem(`chat:${id}`));
       return Array.isArray(parsed) ? parsed : null;
     } catch {
       return null;
     }
   },
-  save(id, messages) {
+  save(id, list) {
     try {
-      localStorage.setItem(`chat:${id}`, JSON.stringify(messages.slice(-40)));
+      localStorage.setItem(`chat:${id}`, JSON.stringify(list.slice(-40)));
     } catch {
-      /* хранилище недоступно — просто не сохраняем */
+      /* хранилище недоступно, просто не сохраняем */
     }
   },
   clear(id) {
@@ -49,22 +54,67 @@ const storage = {
   },
 };
 
-// ───────── Вкладки и стена ─────────
+// ───────── Фото или инициалы ─────────
+function initials(name) {
+  const words = name.replace(/\(.*?\)/g, "").split(/[\s-]+/).filter((w) => /^[А-ЯЁA-Z]/.test(w));
+  return words.slice(0, 2).map((w) => w[0]).join("");
+}
+
+function fillPhoto(el, person, name, color, { square = false } = {}) {
+  el.style.setProperty("--accent", color);
+  el.replaceChildren();
+  if (person && photoSet.has(person)) {
+    const img = document.createElement("img");
+    img.src = `/img/people/${person}${square ? "-sq" : ""}.webp`;
+    img.alt = name;
+    img.loading = "lazy";
+    img.decoding = "async";
+    el.append(img);
+  } else {
+    const span = document.createElement("span");
+    span.className = "initials";
+    span.textContent = initials(name);
+    el.append(span);
+  }
+}
+
+function makePhoto(className, person, name, color, opts) {
+  const el = document.createElement("div");
+  el.className = `photo ${className}`;
+  fillPhoto(el, person, name, color, opts);
+  return el;
+}
+
+// ───────── Классы и стена ─────────
+function heroesWord(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "герой";
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return "героя";
+  return "героев";
+}
+
 function renderTabs() {
-  tabsEl.innerHTML = "";
+  tabsEl.replaceChildren();
   for (const grade of GRADES) {
+    const count = CHARACTERS.filter((c) => c.grade === grade.id).length;
     const btn = document.createElement("button");
-    btn.className = "tab";
+    btn.className = "grade-tab";
     btn.type = "button";
-    btn.role = "tab";
-    btn.textContent = grade.title;
+    btn.setAttribute("role", "tab");
     btn.setAttribute("aria-selected", String(grade.id === currentGrade));
+    const title = document.createElement("b");
+    title.textContent = grade.title;
+    const sub = document.createElement("span");
+    sub.textContent = `${count} ${heroesWord(count)}`;
+    btn.append(title, sub);
     btn.addEventListener("click", () => selectGrade(grade.id));
     tabsEl.append(btn);
   }
 }
 
 function selectGrade(id) {
+  if (id === currentGrade) return;
   currentGrade = id;
   window.history.replaceState(null, "", `#${id}`);
   renderTabs();
@@ -72,12 +122,13 @@ function selectGrade(id) {
 }
 
 function renderWall() {
-  wallEl.innerHTML = "";
-  const list = CHARACTERS.filter((c) => c.grade === currentGrade);
+  const grid = document.createElement("div");
+  grid.className = "wall-grid";
+  wallEl.replaceChildren(grid);
 
-  // Группируем персонажей по произведениям, сохраняя порядок.
+  // Группируем по произведениям, сохраняя порядок из списка.
   const groups = new Map();
-  for (const c of list) {
+  for (const c of CHARACTERS.filter((c) => c.grade === currentGrade)) {
     const key = `${c.author}|${c.work}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(c);
@@ -85,22 +136,27 @@ function renderWall() {
 
   for (const [key, chars] of groups) {
     const [author, work] = key.split("|");
-    const group = document.createElement("div");
-    group.className = "work-group";
+    const section = document.createElement("section");
+    section.className = "work";
 
-    const title = document.createElement("h3");
-    title.className = "work-title";
-    title.textContent = work;
-    const small = document.createElement("small");
-    small.textContent = author;
-    title.append(small);
+    const head = document.createElement("div");
+    head.className = "work-head";
+    const authorPerson = AUTHOR_PERSON[author];
+    head.append(makePhoto("photo-xs", authorPerson, author, chars[0].color, { square: true }));
+    const text = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = work;
+    const p = document.createElement("p");
+    p.textContent = author;
+    text.append(h, p);
+    head.append(text);
 
     const cards = document.createElement("div");
     cards.className = "cards";
     for (const c of chars) cards.append(renderCard(c));
 
-    group.append(title, cards);
-    wallEl.append(group);
+    section.append(head, cards);
+    grid.append(section);
   }
 }
 
@@ -111,71 +167,77 @@ function renderCard(c) {
   card.style.setProperty("--accent", c.color);
   card.setAttribute("aria-label", `Поговорить: ${c.name}`);
 
-  const top = document.createElement("div");
-  top.className = "card-top";
-  const avatar = document.createElement("div");
-  avatar.className = "avatar";
-  avatar.textContent = c.emoji;
-  const info = document.createElement("div");
+  const body = document.createElement("div");
+  body.className = "card-body";
   const name = document.createElement("p");
   name.className = "card-name";
   name.textContent = c.name;
   const role = document.createElement("p");
   role.className = "card-role";
   role.textContent = c.role;
-  info.append(name, role);
-  top.append(avatar, info);
+  const ask = document.createElement("span");
+  const started = storage.load(c.id)?.some((m) => m.role === "user");
+  ask.className = started ? "card-ask is-continue" : "card-ask";
+  ask.textContent = started ? "Продолжить разговор" : "Задать вопрос";
+  body.append(name, role, ask);
 
-  const greet = document.createElement("p");
-  greet.className = "card-greeting";
-  greet.textContent = c.greeting;
-
-  const cta = document.createElement("span");
-  cta.className = "card-cta";
-  cta.textContent = storage.load(c.id)?.length > 1 ? "Продолжить разговор →" : "Задать вопрос →";
-
-  card.append(top, greet, cta);
+  card.append(makePhoto("", c.person, c.name, c.color), body);
   card.addEventListener("click", () => openChat(c.id));
   return card;
 }
 
 // ───────── Чат ─────────
-function openChat(id) {
+function openChat(id, { fromHistory = false } = {}) {
   const c = getCharacter(id);
   if (!c) return;
   current = c;
-  lastFocus = document.activeElement;
+  if (!fromHistory) {
+    lastFocus = document.activeElement;
+    // Кнопка «Назад» на телефоне закрывает чат, а не уходит с сайта.
+    window.history.pushState({ chat: id }, "", `#${c.grade}`);
+  }
 
   chatEl.style.setProperty("--accent", c.color);
-  chatAvatar.style.setProperty("--accent", c.color);
-  chatAvatar.textContent = c.emoji;
+  fillPhoto(chatAvatar, c.person, c.name, c.color, { square: true });
+  fillPhoto(chatPortrait, c.person, c.name, c.color, { square: true });
   chatName.textContent = c.name;
-  chatWork.textContent = `${c.work} · ${c.author}`;
+  chatWork.textContent = `${c.work}, ${c.author}`;
+  chatIntroName.textContent = c.name;
+  chatIntroWork.textContent = `${c.role} · ${c.work}`;
 
-  history = storage.load(c.id) || [{ role: "model", text: c.greeting }];
+  messages = storage.load(c.id) || [{ role: "model", text: c.greeting }];
   renderLog();
   renderSuggestions();
 
   chatEl.hidden = false;
-  backdropEl.hidden = false;
-  document.body.style.overflow = "hidden";
+  document.body.classList.add("chat-open");
   chatInput.value = "";
   autoResize();
-  setTimeout(() => chatInput.focus(), 50);
+  if (window.matchMedia("(hover: hover)").matches) chatInput.focus();
+}
+
+function hideChat() {
+  if (chatEl.hidden) return;
+  chatEl.hidden = true;
+  document.body.classList.remove("chat-open");
+  current = null;
+  renderWall(); // обновить «Продолжить разговор»
+  lastFocus?.focus?.({ preventScroll: true });
 }
 
 function closeChat() {
-  chatEl.hidden = true;
-  backdropEl.hidden = true;
-  document.body.style.overflow = "";
-  current = null;
-  renderWall(); // обновить подписи «Продолжить разговор»
-  lastFocus?.focus?.();
+  if (window.history.state?.chat) window.history.back();
+  else hideChat();
 }
 
+window.addEventListener("popstate", (e) => {
+  if (e.state?.chat) openChat(e.state.chat, { fromHistory: true });
+  else hideChat();
+});
+
 function renderLog() {
-  chatLog.innerHTML = "";
-  for (const m of history) addBubble(m.role, m.text);
+  chatLog.replaceChildren();
+  for (const m of messages) addBubble(m.role, m.text);
   scrollDown();
 }
 
@@ -188,9 +250,8 @@ function addBubble(role, text) {
 }
 
 function renderSuggestions() {
-  chatSuggestions.innerHTML = "";
-  // Подсказки показываем, пока ученик не задал ни одного вопроса.
-  if (!current || history.some((m) => m.role === "user")) return;
+  chatSuggestions.replaceChildren();
+  if (!current || messages.some((m) => m.role === "user")) return;
   for (const q of current.suggestions) {
     const chip = document.createElement("button");
     chip.type = "button";
@@ -202,13 +263,12 @@ function renderSuggestions() {
 }
 
 function scrollDown() {
-  chatLog.scrollTop = chatLog.scrollHeight;
+  chatScroll.scrollTop = chatScroll.scrollHeight;
 }
 
 function setBusy(value) {
   busy = value;
   chatSend.disabled = value;
-  chatInput.disabled = value;
 }
 
 async function send(text) {
@@ -216,10 +276,10 @@ async function send(text) {
   if (!question || busy || !current) return;
   const character = current;
 
-  history.push({ role: "user", text: question });
-  storage.save(character.id, history);
+  messages.push({ role: "user", text: question });
+  storage.save(character.id, messages);
   addBubble("user", question);
-  chatSuggestions.innerHTML = "";
+  chatSuggestions.replaceChildren();
   chatInput.value = "";
   autoResize();
 
@@ -232,40 +292,33 @@ async function send(text) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ characterId: character.id, messages: history }),
+      body: JSON.stringify({ characterId: character.id, messages }),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.reply) throw new Error(data.error || "Не удалось получить ответ.");
+    if (!res.ok || !data.reply) throw new Error(data.error || "Не получилось получить ответ.");
 
-    // Если ученик успел закрыть чат или открыть другой — не трогаем экран.
-    history.push({ role: "model", text: data.reply });
-    storage.save(character.id, history);
-    if (current === character) {
-      typing.textContent = data.reply;
-    }
+    messages.push({ role: "model", text: data.reply });
+    storage.save(character.id, messages);
+    if (current === character) typing.textContent = data.reply;
   } catch (err) {
     // Убираем вопрос без ответа, чтобы его можно было задать снова.
-    history.pop();
-    storage.save(character.id, history);
+    messages.pop();
+    storage.save(character.id, messages);
     if (current === character) {
       typing.remove();
-      const errBubble = addBubble("error", err.message || "Ошибка соединения.");
-      errBubble.className = "msg error";
+      addBubble("error", err.message || "Нет связи с сервером.");
       chatInput.value = question;
       autoResize();
     }
   } finally {
     setBusy(false);
-    if (current === character) {
-      scrollDown();
-      chatInput.focus();
-    }
+    if (current === character) scrollDown();
   }
 }
 
 function autoResize() {
   chatInput.style.height = "auto";
-  chatInput.style.height = `${Math.min(chatInput.scrollHeight, 140)}px`;
+  chatInput.style.height = `${Math.min(chatInput.scrollHeight, 160)}px`;
 }
 
 chatForm.addEventListener("submit", (e) => {
@@ -281,24 +334,23 @@ chatInput.addEventListener("keydown", (e) => {
   }
 });
 
-chatClose.addEventListener("click", closeChat);
-backdropEl.addEventListener("click", closeChat);
+$("chatClose").addEventListener("click", closeChat);
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !chatEl.hidden) closeChat();
 });
 
-chatClear.addEventListener("click", () => {
+$("chatClear").addEventListener("click", () => {
   if (!current || busy) return;
-  if (!confirm("Начать разговор заново? История этого чата будет удалена.")) return;
+  if (!confirm("Начать разговор заново? Переписка с этим героем удалится.")) return;
   storage.clear(current.id);
-  history = [{ role: "model", text: current.greeting }];
+  messages = [{ role: "model", text: current.greeting }];
   renderLog();
   renderSuggestions();
-  chatInput.focus();
 });
 
 // ───────── Старт ─────────
 const fromHash = Number(location.hash.slice(1));
 if (GRADES.some((g) => g.id === fromHash)) currentGrade = fromHash;
+window.history.replaceState(null, "", location.hash || `#${currentGrade}`);
 renderTabs();
 renderWall();
