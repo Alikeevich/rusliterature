@@ -50,23 +50,51 @@ export default function Chat({ character: c, onClose }: Props) {
     setError(null);
     setBusy(true);
 
+    let answer = "";
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ characterId: c.id, messages: next }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.reply) throw new Error(data.error || "Не получилось получить ответ.");
-      const done: Message[] = [...next, { role: "model", text: data.reply }];
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(
+          data.error ||
+            (res.status === 504
+              ? "Герой слишком долго думает. Попробуйте спросить ещё раз."
+              : "Не получилось получить ответ.")
+        );
+      }
+
+      // Ответ приходит потоком: показываем текст по мере появления.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        answer += decoder.decode(value, { stream: true });
+        setMessages([...next, { role: "model", text: answer.trimStart() }]);
+      }
+      answer = answer.trim();
+      if (!answer) throw new Error("Не получилось получить ответ.");
+      const done: Message[] = [...next, { role: "model", text: answer }];
       setMessages(done);
       saveChat(c.id, done);
     } catch (err) {
-      // Убираем вопрос без ответа, чтобы его можно было задать снова.
-      setMessages(messages);
-      saveChat(c.id, messages);
-      setInput(question);
-      setError(err instanceof Error ? err.message : "Нет связи с сервером.");
+      const message = err instanceof Error ? err.message : "Нет связи с сервером.";
+      if (answer.trim()) {
+        // Связь оборвалась посреди ответа: оставляем то, что успело прийти.
+        const partial: Message[] = [...next, { role: "model", text: answer.trim() }];
+        setMessages(partial);
+        saveChat(c.id, partial);
+      } else {
+        // Убираем вопрос без ответа, чтобы его можно было задать снова.
+        setMessages(messages);
+        saveChat(c.id, messages);
+        setInput(question);
+        setError(message === "Failed to fetch" ? "Нет связи с сервером. Проверьте интернет." : message);
+      }
     } finally {
       setBusy(false);
     }
@@ -160,7 +188,7 @@ export default function Chat({ character: c, onClose }: Props) {
                 {messages.map((m, i) => (
                   <Bubble key={`${i}-${m.role}`} message={m} character={c} />
                 ))}
-                {busy && <Typing key="typing" character={c} />}
+                {busy && messages[messages.length - 1]?.role === "user" && <Typing key="typing" character={c} />}
               </AnimatePresence>
             </ul>
 

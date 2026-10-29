@@ -1,19 +1,23 @@
 // POST /api/chat
 // Тело запроса: { characterId: string, messages: [{ role: "user" | "model", text: string }] }
-// Ответ: { reply: string } или { error: string }
+// Ответ: текст героя потоком (text/plain) или { error: string } с кодом ошибки
 //
 // Переменные окружения (Vercel: Settings, Environment Variables):
 //   GEMINI_API_KEY - ключ из https://aistudio.google.com/apikey (обязательно)
 //   GEMINI_MODEL   - модель (необязательно, по умолчанию gemini-3.8-flash)
 
 import { getCharacter } from "@/lib/characters";
-import { buildSystemPrompt, cleanReply } from "@/lib/prompt";
+import { buildSystemPrompt, cleanChunk } from "@/lib/prompt";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
 const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"];
 const MAX_HISTORY = 20;
+// Vercel обрывает функцию через maxDuration, поэтому держим запас.
+const FIRST_CHUNK_TIMEOUT_MS = 15_000;
+const WAIT_BUDGET_MS = 42_000;
+const TOTAL_BUDGET_MS = 56_000;
 const MAX_MESSAGE_LENGTH = 1000;
 
 type Content = { role: "user" | "model"; parts: { text: string }[] };
@@ -50,7 +54,7 @@ function requestBody(model: string, systemPrompt: string, contents: Content[]) {
     contents,
     generationConfig: {
       temperature: 0.8,
-      maxOutputTokens: 8192,
+      maxOutputTokens: 2048,
       // Модели 3.x по умолчанию долго «думают»; для живого чата хватает low.
       ...(model.startsWith("gemini-3") ? { thinkingConfig: { thinkingLevel: "low" } } : {}),
     },
@@ -92,7 +96,121 @@ function explain(e: ApiError) {
   return error("Собеседник сейчас не может ответить. Попробуйте чуть позже.", 502);
 }
 
+type Events = AsyncGenerator<GeminiEvent, void, unknown>;
+type GeminiEvent = {
+  candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[];
+  error?: unknown;
+};
+
+// Разбор потока Server-Sent Events от Gemini.
+async function* sseEvents(body: ReadableStream<Uint8Array>): Events {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line.startsWith("data:")) continue;
+        try {
+          yield JSON.parse(line.slice(5));
+        } catch {
+          /* неполная строка, пропускаем */
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function eventText(event: GeminiEvent) {
+  return (event.candidates?.[0]?.content?.parts ?? [])
+    .filter((p) => !p.thought)
+    .map((p) => p.text || "")
+    .join("");
+}
+
+type Attempt =
+  | { ok: true; first: string; events: Events; abort: AbortController }
+  | { ok: false; error: ApiError | "timeout" | "network" };
+
+// Один запрос к модели: ждём первый кусочек текста не дольше timeoutMs.
+async function attempt(model: string, apiKey: string, body: string, timeoutMs: number): Promise<Attempt> {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body,
+      signal: abort.signal,
+    });
+
+    if (!response.ok || !response.body) {
+      const data = await response.json().catch(() => null);
+      console.error("Model API error", model, response.status, JSON.stringify(data));
+      return { ok: false, error: readApiError(response.status, data) };
+    }
+
+    const events = sseEvents(response.body);
+    while (true) {
+      const next = await events.next();
+      if (next.done) return { ok: true, first: "", events, abort };
+      if (next.value.error) {
+        console.error("Model stream error", model, JSON.stringify(next.value.error));
+        return { ok: false, error: "network" };
+      }
+      const text = eventText(next.value);
+      if (text) return { ok: true, first: text, events, abort };
+    }
+  } catch (err) {
+    const timedOut = abort.signal.aborted;
+    console.error(timedOut ? "Model timeout" : "Model request failed", model, timedOut ? `${timeoutMs}ms` : err);
+    return { ok: false, error: timedOut ? "timeout" : "network" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function streamReply(first: string, events: Events, abort: AbortController, deadline: number) {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const kill = setTimeout(() => abort.abort(), Math.max(1000, deadline - Date.now()));
+      controller.enqueue(
+        encoder.encode(
+          first ? cleanChunk(first) : "Хм... Об этом мне трудно говорить. Спроси меня лучше о чём-нибудь другом из книги."
+        )
+      );
+      try {
+        while (true) {
+          const next = await events.next();
+          if (next.done) break;
+          const text = eventText(next.value);
+          if (text) controller.enqueue(encoder.encode(cleanChunk(text)));
+        }
+      } catch {
+        /* оборвалось по времени: отдаём то, что успели */
+      } finally {
+        clearTimeout(kill);
+        controller.close();
+      }
+    },
+    cancel() {
+      abort.abort();
+    },
+  });
+}
+
 export async function POST(req: Request) {
+  const startedAt = Date.now();
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) return error("На сервере не задан GEMINI_API_KEY. Добавьте его в настройках Vercel и сделайте Redeploy.", 500);
 
@@ -104,43 +222,31 @@ export async function POST(req: Request) {
   if (!contents) return error("Пустое сообщение", 400);
 
   const systemPrompt = buildSystemPrompt(character);
-  let lastError: ApiError | null = null;
+  let lastError: ApiError | "timeout" | "network" | null = null;
 
   for (const model of modelsToTry()) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: requestBody(model, systemPrompt, contents),
+    const left = startedAt + WAIT_BUDGET_MS - Date.now();
+    if (left < 4000) break;
+
+    const result = await attempt(model, apiKey, requestBody(model, systemPrompt, contents), Math.min(FIRST_CHUNK_TIMEOUT_MS, left));
+    if (result.ok) {
+      console.log("Model answered", model, `${Date.now() - startedAt}ms`);
+      return new Response(streamReply(result.first, result.events, result.abort, startedAt + TOTAL_BUDGET_MS), {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          "X-Accel-Buffering": "no",
+        },
       });
-    } catch (err) {
-      console.error("Model API request failed", model, err);
-      return error("Нет связи с сервером модели. Попробуйте снова.", 502);
     }
 
-    const data = await response.json().catch(() => null);
-
-    if (!response.ok) {
-      lastError = readApiError(response.status, data);
-      console.error("Model API error", model, response.status, JSON.stringify(data));
-      if (isModelUnavailable(lastError)) continue;
-      return explain(lastError);
-    }
-
-    const reply: string | undefined = data?.candidates?.[0]?.content?.parts
-      ?.filter((p: { thought?: boolean }) => !p.thought)
-      .map((p: { text?: string }) => p.text || "")
-      .join("")
-      .trim();
-
-    return Response.json({
-      reply: reply
-        ? cleanReply(reply)
-        : "Хм... Об этом мне трудно говорить. Спроси меня лучше о чём-нибудь другом из книги.",
-    });
+    lastError = result.error;
+    if (lastError === "timeout" || lastError === "network" || isModelUnavailable(lastError)) continue;
+    return explain(lastError);
   }
 
-  return explain(lastError ?? { status: 404, message: "model", reason: "" });
+  if (lastError === "timeout" || lastError === null)
+    return error("Герой слишком долго думает. Попробуйте спросить ещё раз через минуту.", 504);
+  if (lastError === "network") return error("Нет связи с сервером модели. Попробуйте снова.", 502);
+  return explain(lastError);
 }
