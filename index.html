@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Адал азамат — беседы с героями книг</title>
+  <meta name="description" content="Стена персонажей по русской литературе для 6–9 классов: задай вопрос героям книг. Тема «Адал азамат»." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=PT+Serif:wght@400;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="hero">
+    <div class="ornament" aria-hidden="true"></div>
+    <div class="hero-inner">
+      <p class="hero-kicker">Русская литература · Русский язык</p>
+      <h1>Адал азамат</h1>
+      <p class="hero-sub">Стена героев книг. Выбери класс, нажми на персонажа и задай ему вопрос — почему он так поступил, что чувствовал, чему нас учит.</p>
+    </div>
+    <div class="ornament ornament-bottom" aria-hidden="true"></div>
+  </header>
+
+  <main class="container">
+    <nav class="tabs" role="tablist" aria-label="Классы" id="tabs"></nav>
+    <section class="wall" id="wall" role="tabpanel" aria-live="polite"></section>
+  </main>
+
+  <footer class="footer">
+    <p>Ответы персонажей генерирует ИИ (Google Gemini) — он может ошибаться. Сверяйтесь с текстом произведения.</p>
+  </footer>
+
+  <!-- Окно чата -->
+  <div class="chat-backdrop" id="chatBackdrop" hidden></div>
+  <aside class="chat" id="chat" role="dialog" aria-modal="true" aria-labelledby="chatName" hidden>
+    <header class="chat-head">
+      <div class="avatar" id="chatAvatar" aria-hidden="true"></div>
+      <div class="chat-title">
+        <h2 id="chatName"></h2>
+        <p id="chatWork"></p>
+      </div>
+      <button class="icon-btn" id="chatClear" title="Начать заново" aria-label="Начать разговор заново">↺</button>
+      <button class="icon-btn" id="chatClose" title="Закрыть" aria-label="Закрыть чат">✕</button>
+    </header>
+    <div class="chat-log" id="chatLog"></div>
+    <div class="chat-suggestions" id="chatSuggestions"></div>
+    <form class="chat-form" id="chatForm" autocomplete="off">
+      <textarea id="chatInput" rows="1" maxlength="1000" placeholder="Задай вопрос…" aria-label="Ваш вопрос"></textarea>
+      <button type="submit" class="send-btn" id="chatSend" aria-label="Отправить">➤</button>
+    </form>
+  </aside>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

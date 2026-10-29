@@ -1,0 +1,13 @@
+{
+  "name": "adal-azamat-literature",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Стена персонажей: чат с героями произведений по русской литературе (6–9 классы) на тему «Адал азамат»",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}
